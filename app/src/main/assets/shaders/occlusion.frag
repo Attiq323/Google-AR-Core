@@ -59,7 +59,8 @@ float Depth_GetVirtualSceneDepthMillimeters(const sampler2D depthTexture,
   const float kMetersToMillimeters = 1000.0;
   // This value was empirically chosen to correct errors with objects appearing
   // to phase through the floor. In millimeters.
-  const float kBias = -80.0;
+  // Increased bias for far objects to prevent fading at distance
+  const float kBias = -200.0;
   float ndc = 2.0 * texture(depthTexture, depthUv).x - 1.0;
   return 2.0 * zNear * zFar / (zFar + zNear - ndc * (zFar - zNear)) *
              kMetersToMillimeters +

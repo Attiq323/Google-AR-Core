@@ -17,9 +17,31 @@
 precision mediump float;
 
 uniform vec4 u_Color;
+uniform float u_MinConfidence;
 
+in float v_Confidence;
 out vec4 o_FragColor;
 
 void main() {
-  o_FragColor = u_Color;
+  // Remove noisy/unstable points.
+  if (v_Confidence < u_MinConfidence) {
+    discard;
+  }
+
+  // Make points circular (instead of square).
+  vec2 p = gl_PointCoord - vec2(0.5);
+  float r = length(p);
+
+  // Soft edge: inside -> 1, outside -> 0
+  float alphaCircle = smoothstep(0.5, 0.35, r);
+
+  // Fade in based on confidence.
+  float alphaConf = smoothstep(u_MinConfidence, 1.0, v_Confidence);
+
+  float alpha = u_Color.a * alphaCircle * alphaConf;
+  if (alpha <= 0.001) {
+    discard;
+  }
+
+  o_FragColor = vec4(u_Color.rgb, alpha);
 }

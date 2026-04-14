@@ -66,6 +66,7 @@ import com.google.ar.core.examples.java.common.samplerender.GLError;
 import com.google.ar.core.examples.java.common.samplerender.Mesh;
 import com.google.ar.core.examples.java.common.samplerender.SampleRender;
 import com.google.ar.core.examples.java.common.samplerender.Shader;
+import com.google.ar.core.examples.java.common.samplerender.Shader.BlendFactor;
 import com.google.ar.core.examples.java.common.samplerender.Texture;
 import com.google.ar.core.examples.java.common.samplerender.VertexBuffer;
 import com.google.ar.core.examples.java.common.samplerender.arcore.BackgroundRenderer;
@@ -131,7 +132,24 @@ public class HelloArActivity extends AppCompatActivity implements SampleRender.R
   private TapHelper tapHelper;
   private SampleRender render;
 
-  private PlaneRenderer planeRenderer;
+  // Plane visualization focus (Filament-like): one stable focus plane type at a time.
+private Plane.Type focusPlaneTypeStable = null;
+private Plane.Type focusPlaneTypeCandidate = null;
+private int focusTypeStableFrames = 0;
+private static final int FOCUS_TYPE_STABILIZE_FRAMES = 8;
+
+private final float[] focusPointWorld = new float[3];
+private boolean hasFocusPoint = false;
+private float lastFocusHitDistance = 3.0f; // meters
+
+private static final float PLANE_SPOTLIGHT_RADIUS_M = 1.0f;
+
+private PlaneRenderer planeRenderer;
+  // Filament-like spotlight focus for plane visualization.
+  private final float[] planeSpotlightFocusPoint = new float[] {0f, 0f, 0f};
+  private float lastPlaneHitDistanceM = 3.0f;
+//  private static final float PLANE_SPOTLIGHT_RADIUS_M = 0.6f;
+
   private BackgroundRenderer backgroundRenderer;
   private Framebuffer virtualSceneFramebuffer;
   private boolean hasSetTextureNames = false;
@@ -426,9 +444,15 @@ public class HelloArActivity extends AppCompatActivity implements SampleRender.R
                   "shaders/point_cloud.vert",
                   "shaders/point_cloud.frag",
                   /* defines= */ null)
+              // Filament-like point cloud: round dots + confidence filtering.
               .setVec4(
-                  "u_Color", new float[] {31.0f / 255.0f, 188.0f / 255.0f, 210.0f / 255.0f, 1.0f})
-              .setFloat("u_PointSize", 5.0f);
+                  "u_Color", new float[] {1.0f, 1.0f, 1.0f, 1.0f})
+              .setFloat("u_PointSize", 8.0f)
+              .setFloat("u_MinConfidence", 0.30f)
+              .setBlend(
+                  BlendFactor.SRC_ALPHA, BlendFactor.ONE_MINUS_SRC_ALPHA, // RGB
+                  BlendFactor.ONE, BlendFactor.ONE_MINUS_SRC_ALPHA)      // ALPHA
+              .setDepthWrite(false);
       // four entries per vertex: X, Y, Z, confidence
       pointCloudVertexBuffer =
           new VertexBuffer(render, /* numberOfEntriesPerVertex= */ 4, /* entries= */ null);
@@ -502,6 +526,63 @@ public class HelloArActivity extends AppCompatActivity implements SampleRender.R
     displayRotationHelper.onSurfaceChanged(width, height);
     virtualSceneFramebuffer.resize(width, height);
   }
+
+/** Updates the plane-visualization focus point and stable focus plane type (horizontal vs vertical). */
+private void updatePlaneFocus(Frame frame, Camera camera) {
+  hasFocusPoint = false;
+  Plane.Type hitType = null;
+
+  float cx = surfaceView.getWidth() * 0.5f;
+  float cy = surfaceView.getHeight() * 0.5f;
+
+  // Prefer planes for focus, because plane visualization is tied to planes.
+  for (HitResult hit : frame.hitTest(cx, cy)) {
+    Trackable t = hit.getTrackable();
+    if (t instanceof Plane) {
+      Plane plane = (Plane) t;
+      if (!plane.isPoseInPolygon(hit.getHitPose())) {
+        continue;
+      }
+      // In-front check (avoid back-facing).
+      if (PlaneRenderer.calculateDistanceToPlane(hit.getHitPose(), camera.getPose()) <= 0) {
+        continue;
+      }
+
+      hit.getHitPose().getTranslation(focusPointWorld, 0);
+      hasFocusPoint = true;
+      lastFocusHitDistance = Math.max(0.2f, Math.min(3.0f, hit.getDistance()));
+      hitType = plane.getType();
+      break;
+    }
+  }
+
+  // If we didn't hit a plane, keep a smooth focus point in front of the camera.
+  if (!hasFocusPoint) {
+    Pose cameraPose = camera.getPose();
+    float[] zAxis = cameraPose.getZAxis();
+    // ARCore zAxis points "backwards" (camera looks down -Z), so move forward by -zAxis.
+    focusPointWorld[0] = cameraPose.tx() - zAxis[0] * lastFocusHitDistance;
+    focusPointWorld[1] = cameraPose.ty() - zAxis[1] * lastFocusHitDistance;
+    focusPointWorld[2] = cameraPose.tz() - zAxis[2] * lastFocusHitDistance;
+    hasFocusPoint = true;
+    hitType = null; // no plane hit this frame
+  }
+
+  // ---- Stable focus plane type (hysteresis) to avoid flicker near edges.
+  // Candidate only updates when we actually hit a plane.
+  if (hitType != null) {
+    if (focusPlaneTypeCandidate != hitType) {
+      focusPlaneTypeCandidate = hitType;
+      focusTypeStableFrames = 1;
+    } else {
+      focusTypeStableFrames++;
+    }
+
+    if (focusTypeStableFrames >= FOCUS_TYPE_STABILIZE_FRAMES) {
+      focusPlaneTypeStable = focusPlaneTypeCandidate;
+    }
+  }
+}
 
   @Override
   public void onDrawFrame(SampleRender render) {
@@ -623,7 +704,10 @@ public class HelloArActivity extends AppCompatActivity implements SampleRender.R
       render.draw(pointCloudMesh, pointCloudShader);
     }
 
-    // Visualize planes.
+    // Visualize planes (Filament-like spotlight around where the user is looking).
+    updatePlaneSpotlight(frame, camera);
+//    planeRenderer.setSpotlight(true, focusPointWorld, PLANE_SPOTLIGHT_RADIUS_M);
+    planeRenderer.setFocusPlaneType(focusPlaneTypeStable);
     planeRenderer.drawPlanes(
         render,
         session.getAllTrackables(Plane.class),
@@ -706,55 +790,53 @@ public class HelloArActivity extends AppCompatActivity implements SampleRender.R
       for (HitResult hit : frame.hitTest(tap.getX(), tap.getY())) {
         Trackable trackable = hit.getTrackable();
 
-        if (trackable instanceof Point
-                || (trackable instanceof Plane && ((Plane) trackable).isPoseInPolygon(hit.getHitPose()))
-                || trackable instanceof DepthPoint) {
+        
+// --- Surface-locked placement (Plane first, then DepthPoint) ---
+HitResult bestPlaneHit = null;
+HitResult bestDepthHit = null;
 
-          // Apply surface offset to ensure arrow is on surface, not inside
-          // Same offset as drawing (2mm above surface)
-          Pose hitPose = hit.getHitPose();
-          try {
-            float[] normal = new float[3];
-            hitPose.getTransformedAxis(1, 1.0f, normal, 0);
-            float normalLength = (float) Math.sqrt(normal[0]*normal[0] + normal[1]*normal[1] + normal[2]*normal[2]);
-            if (normalLength > 0.01f && normalLength < 10.0f) {
-              // Create offset translation (2mm above surface along normal)
-              float[] offsetTranslation = new float[3];
-              offsetTranslation[0] = normal[0] * 0.002f; // 2mm offset above surface
-              offsetTranslation[1] = normal[1] * 0.002f;
-              offsetTranslation[2] = normal[2] * 0.002f;
+for (HitResult h : frame.hitTest(tap.getX(), tap.getY())) {
+    Trackable t = h.getTrackable();
 
-              // Create identity rotation quaternion (no rotation change)
-              // Quaternion format: [x, y, z, w] where identity is [0, 0, 0, 1]
-              float[] identityRotation = new float[4];
-              identityRotation[0] = 0.0f; // x
-              identityRotation[1] = 0.0f; // y
-              identityRotation[2] = 0.0f; // z
-              identityRotation[3] = 1.0f; // w (identity quaternion)
-
-              // Create offset pose using ARCore Pose constructor
-              // Pose(float[] translation, float[] rotationQuaternion)
-              // This represents a pure translation (no rotation change)
-              Pose offsetPose = new Pose(offsetTranslation, identityRotation);
-
-              // Compose poses: hitPose * offsetPose = final pose with offset applied
-              // This applies the offset in the hit pose's local coordinate frame
-              Pose finalPose = hitPose.compose(offsetPose);
-
-              // Create anchor from Session using correct ARCore API
-              // Session.createAnchor(Pose) is the proper way to create an anchor from a pose
-              wrappedAnchors.add(new WrappedAnchor(session.createAnchor(finalPose),trackable));
-            } else {
-              // If normal is invalid, use original pose
-              wrappedAnchors.add(new WrappedAnchor(hit.createAnchor(),trackable));
-            }
-          } catch (Exception e) {
-            // If offset fails, use original pose
-            Log.w(TAG, "Could not apply surface offset for arrow: " + e.getMessage());
-            wrappedAnchors.add(new WrappedAnchor(hit.createAnchor(),trackable));
-          }
-          break;
+    if (t instanceof Plane) {
+        Plane p = (Plane) t;
+        if (p.isPoseInPolygon(h.getHitPose())
+                && PlaneRenderer.calculateDistanceToPlane(
+                    h.getHitPose(), camera.getPose()) > 0) {
+            bestPlaneHit = h;
+            break;
         }
+    } else if (t instanceof DepthPoint) {
+        bestDepthHit = h;
+    }
+}
+
+HitResult finalHit = bestPlaneHit != null ? bestPlaneHit : bestDepthHit;
+
+if (finalHit != null) {
+    Pose pose = finalHit.getHitPose();
+
+    float[] normal = new float[3];
+    pose.getTransformedAxis(1, 1.0f, normal, 0);
+
+    float[] offset = new float[]{
+        normal[0] * 0.002f,
+        normal[1] * 0.002f,
+        normal[2] * 0.002f
+    };
+
+    Pose offsetPose = new Pose(offset, new float[]{0,0,0,1});
+    Pose finalPose = pose.compose(offsetPose);
+
+    wrappedAnchors.add(
+        new WrappedAnchor(
+            session.createAnchor(finalPose),
+            finalHit.getTrackable()
+        )
+    );
+}
+break;
+
       }
 
 
@@ -777,7 +859,7 @@ public class HelloArActivity extends AppCompatActivity implements SampleRender.R
 //                  && ((Plane) trackable).isPoseInPolygon(hit.getHitPose())
 //                  && (PlaneRenderer.calculateDistanceToPlane(hit.getHitPose(), camera.getPose())
 //                      > 0))
-//              || (trackable instanceof Point
+//              // removed Point
 //                  && ((Point) trackable).getOrientationMode()
 //                      == OrientationMode.ESTIMATED_SURFACE_NORMAL)
 //              || (trackable instanceof InstantPlacementPoint)
@@ -827,12 +909,13 @@ public class HelloArActivity extends AppCompatActivity implements SampleRender.R
           if ((trackable instanceof Plane
                   && ((Plane) trackable).isPoseInPolygon(hit.getHitPose())
                   && (PlaneRenderer.calculateDistanceToPlane(hit.getHitPose(), camera.getPose())
-                      > 0))
-              || (trackable instanceof Point
-                  && ((Point) trackable).getOrientationMode()
-                      == OrientationMode.ESTIMATED_SURFACE_NORMAL)
-              || (trackable instanceof InstantPlacementPoint)
-              || (trackable instanceof DepthPoint)) {
+                      > 0)))  {
+              // removed Point
+//                  && ((Point) trackable).getOrientationMode()
+//                      == OrientationMode.ESTIMATED_SURFACE_NORMAL)
+//              || (trackable instanceof InstantPlacementPoint)
+//              || (trackable instanceof DepthPoint))
+
 
             float[] pt = new float[3];
             hit.getHitPose().getTranslation(pt, 0);
@@ -982,7 +1065,42 @@ public class HelloArActivity extends AppCompatActivity implements SampleRender.R
         instantPlacementSettings.isInstantPlacementEnabled();
   }
 
-  /** Checks if we detected at least one plane. */
+  
+  /** Updates plane spotlight focus point (Filament-like) using a center-screen hit test. */
+  private void updatePlaneSpotlight(Frame frame, Camera camera) {
+    boolean hasHit = false;
+
+    final float cx = surfaceView.getWidth() * 0.5f;
+    final float cy = surfaceView.getHeight() * 0.5f;
+
+    // Prefer a real plane hit in front of the camera.
+    for (HitResult hit : frame.hitTest(cx, cy)) {
+      Trackable t = hit.getTrackable();
+      if (t instanceof Plane
+          && ((Plane) t).isPoseInPolygon(hit.getHitPose())
+          && PlaneRenderer.calculateDistanceToPlane(hit.getHitPose(), camera.getPose()) > 0) {
+        hit.getHitPose().getTranslation(planeSpotlightFocusPoint, 0);
+        lastPlaneHitDistanceM = hit.getDistance();
+        hasHit = true;
+        break;
+      }
+    }
+
+    if (!hasHit) {
+      // If no hit, project a point forward at the last known distance. This avoids spotlight popping.
+      Pose cameraPose = camera.getPose();
+      float[] zAxis = cameraPose.getZAxis();
+      // camera forward is -Z axis
+      planeSpotlightFocusPoint[0] = cameraPose.tx() - zAxis[0] * lastPlaneHitDistanceM;
+      planeSpotlightFocusPoint[1] = cameraPose.ty() - zAxis[1] * lastPlaneHitDistanceM;
+      planeSpotlightFocusPoint[2] = cameraPose.tz() - zAxis[2] * lastPlaneHitDistanceM;
+    }
+
+    // Feed spotlight to PlaneRenderer.
+//    planeRenderer.setSpotlight(true, planeSpotlightFocusPoint, PLANE_SPOTLIGHT_RADIUS_M);
+  }
+
+/** Checks if we detected at least one plane. */
   private boolean hasTrackingPlane() {
     for (Plane plane : session.getAllTrackables(Plane.class)) {
       if (plane.getTrackingState() == TrackingState.TRACKING) {
@@ -1062,7 +1180,7 @@ public class HelloArActivity extends AppCompatActivity implements SampleRender.R
     // IMPORTANT: detect both horizontal and vertical planes (walls, table sides, etc.)
     config.setPlaneFindingMode(Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL);
     if (instantPlacementSettings.isInstantPlacementEnabled()) {
-      config.setInstantPlacementMode(InstantPlacementMode.LOCAL_Y_UP);
+      config.setInstantPlacementMode(InstantPlacementMode.DISABLED);
     } else {
       config.setInstantPlacementMode(InstantPlacementMode.DISABLED);
     }
