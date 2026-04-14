@@ -140,14 +140,14 @@ private static final int FOCUS_TYPE_STABILIZE_FRAMES = 8;
 
 private final float[] focusPointWorld = new float[3];
 private boolean hasFocusPoint = false;
-private float lastFocusHitDistance = 3.0f; // meters
+private float lastFocusHitDistance = 2.0f; // meters
 
 private static final float PLANE_SPOTLIGHT_RADIUS_M = 1.0f;
 
 private PlaneRenderer planeRenderer;
   // Filament-like spotlight focus for plane visualization.
   private final float[] planeSpotlightFocusPoint = new float[] {0f, 0f, 0f};
-  private float lastPlaneHitDistanceM = 3.0f;
+  private float lastPlaneHitDistanceM = 2.0f;
 //  private static final float PLANE_SPOTLIGHT_RADIUS_M = 0.6f;
 
   private BackgroundRenderer backgroundRenderer;
